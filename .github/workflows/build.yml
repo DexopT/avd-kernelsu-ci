@@ -48,7 +48,11 @@ on:
 
 jobs:
   build:
-    runs-on: ubuntu-24.04
+    # Ubuntu 22.04 deliberately: this 2023-era kernel tree builds host tools
+    # (tools/bpf/resolve_btfids) against its hermetic older glibc sysroot, while
+    # Ubuntu 24.04's glibc 2.39 headers emit C23 names (__isoc23_strtol/_strtoul/_strtoull)
+    # that do not exist in that sysroot -> "ld.lld: error: undefined symbol".
+    runs-on: ubuntu-22.04
     timeout-minutes: 350
 
     steps:
