@@ -117,15 +117,19 @@ jobs:
           ls -d drivers/kernelsu 2>/dev/null || true
           grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null | head -4
           grep -n "config KSU" -A5 drivers/kernelsu/Kconfig 2>/dev/null | head -8
-          echo "--- convert the symlink into real sources (Kleaf sandbox globs real files) ---"
-          if [ -L drivers/kernelsu ]; then
-            tgt="$(readlink -f drivers/kernelsu)"
-            rm drivers/kernelsu
-            cp -r "$tgt" drivers/kernelsu
-            echo "copied driver sources from $tgt"
+          # IMPORTANT: keep drivers/kernelsu as the SYMLINK that setup.sh creates.
+          # Kbuild adds -I$(srctree)/$(src) (= common/drivers/kernelsu) and the driver does
+          #   #include "uapi/app_profile.h"
+          # The uapi/ directory lives at the *repository root*, so it is only reachable through
+          # the symlink (.. resolves to the clone). Copying kernel/ here breaks that include:
+          #   fatal error: 'uapi/app_profile.h' file not found
+          echo "--- symlink check (must be a symlink, not a copy) ---"
+          ls -la drivers/kernelsu | head -2
+          if [ ! -L drivers/kernelsu ]; then
+            echo "::error::drivers/kernelsu is not a symlink; uapi/ includes will fail"
+            exit 1
           fi
-          ls -la drivers/kernelsu/Kbuild drivers/kernelsu/Kconfig 2>/dev/null
-          grep -m1 "obj-\$(CONFIG_KSU)" drivers/kernelsu/Kbuild 2>/dev/null || true
+          echo "uapi via symlink: $(ls drivers/kernelsu/uapi/app_profile.h 2>/dev/null || echo MISSING)"
 
       - name: Enable CONFIG_KSU
         env:
