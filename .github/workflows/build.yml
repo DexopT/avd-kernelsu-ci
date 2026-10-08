@@ -112,20 +112,40 @@ jobs:
           echo "--- integration markers ---"
           ls -d drivers/kernelsu 2>/dev/null || true
           grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null | head -4
-          grep -n "config KSU" -A4 drivers/kernelsu/Kconfig 2>/dev/null | head -8
+          grep -n "config KSU" -A5 drivers/kernelsu/Kconfig 2>/dev/null | head -8
+          echo "--- convert the symlink into real sources (Kleaf sandbox globs real files) ---"
+          if [ -L drivers/kernelsu ]; then
+            tgt="$(readlink -f drivers/kernelsu)"
+            rm drivers/kernelsu
+            cp -r "$tgt" drivers/kernelsu
+            echo "copied driver sources from $tgt"
+          fi
+          ls -la drivers/kernelsu/Kbuild drivers/kernelsu/Kconfig 2>/dev/null
+          grep -m1 "obj-\$(CONFIG_KSU)" drivers/kernelsu/Kbuild 2>/dev/null || true
 
-      - name: Enable CONFIG_KSU in the base defconfig
+      - name: Enable CONFIG_KSU
         env:
           KSU_MODE: ${{ inputs.ksu_mode }}
         run: |
-          cd "$KERNEL_DIR/common"
-          DEFCONFIG=arch/arm64/configs/gki_defconfig
-          if [ "$KSU_MODE" = "module" ]; then VALUE=m; else VALUE=y; fi
-          # drop any existing KSU lines, then append ours
-          sed -i '/^CONFIG_KSU\b/d' "$DEFCONFIG"
-          echo "CONFIG_KSU=$VALUE" >> "$DEFCONFIG"
-          echo "--- tail of $DEFCONFIG ---"; tail -3 "$DEFCONFIG"
-          grep -n "^CONFIG_KSU" "$DEFCONFIG"
+          cd "$KERNEL_DIR"
+          if [ "$KSU_MODE" = "module" ]; then
+            # Module mode: set it in the virtual-device fragment. Fragments are merged on top
+            # of the base config, so the base gki_defconfig stays byte-identical to upstream
+            # (Kleaf checks `savedefconfig == gki_defconfig` exactly).
+            FRAG=common-modules/virtual-device/virtual_device.fragment
+            sed -i '/^CONFIG_KSU\b/d' "$FRAG"
+            printf 'CONFIG_KSU=m\n' >> "$FRAG"
+            echo "--- $FRAG (tail) ---"; tail -3 "$FRAG"
+          else
+            # Builtin: nothing to do. drivers/kernelsu/Kconfig is sourced by drivers/Kconfig
+            # and declares `default y` (deps KPROBES && EXT4_FS are already =y in gki_defconfig),
+            # so KSU is enabled automatically. Hand-adding CONFIG_KSU=y to gki_defconfig would
+            # FAIL Kleaf's check because savedefconfig drops symbols equal to their default.
+            echo "builtin mode: KSU is enabled by its Kconfig 'default y'; base defconfig untouched."
+          fi
+          echo "--- Kconfig wiring ---"
+          grep -n "drivers/kernelsu/Kconfig" common/drivers/Kconfig || true
+          grep -m1 "obj-\$(CONFIG_KSU)" common/drivers/Makefile || true
 
       - name: Build with Kleaf (virtual_device_aarch64_dist)
         run: |
