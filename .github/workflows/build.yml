@@ -1,24 +1,34 @@
-name: Build KernelSU Next for Android Studio AVD (kernel 6.1.23, arm64)
+name: Build KernelSU Next for Android Studio AVD (arm64)
 
-# WHY THIS EXISTS
-# Android Studio's emulator images ship a *frozen* kernel: 6.1.23-android14-4-00257
-# (build id ab9964412, arm64, virtual-device/goldfish). KernelSU's officially published
-# prebuilt LKM modules are built against the newest kernel of each KMI generation
-# (6.1.166 at the time of writing). KernelSU's driver patches the arm64 syscall
-# dispatcher and registers hooks whose layout is version specific, so on this emulator
-# kernel the prebuilt module loads but never initialises its hooks:
-#   - module is resident in /sys/module/kernelsu
-#   - no "welcome to KernelSU" printk
-#   - /data/adb/ksud is never served by the driver
-#   - the KernelSU Next manager reports "Not installed"
-# (observed with both KernelSU Next v3.4.0 and upstream KernelSU v3.3.0 prebuilt LKMs)
+# GOAL
+# Produce a KernelSU Next that actually runs on an Android Studio emulator (AVD).
 #
-# This workflow builds KernelSU against the emulator's OWN kernel commit and publishes:
-#   * kernelsu.ko  -> drop into the patched AVD ramdisk (LKM mode, stock kernel intact)
-#   * Image        -> GKI-style fallback: boot with -kernel; stock ramdisk modules can be
-#                     replaced by the modules built here (also uploaded)
+# WHY THE PUBLISHED PREBUILT LKM DOES NOT WORK HERE
+# The AVD image android-34/google_apis_playstore/arm64-v8a ships a frozen kernel:
+#   6.1.23-android14-4-00257-g7e35917775b8-ab9964412   (built 2023-04-17)
+# KernelSU's published prebuilt LKM modules are built against the newest kernel of the
+# KMI generation (6.1.166 at time of writing). KernelSU's driver patches the arm64
+# syscall dispatcher and registers version-specific hooks, so on the emulator kernel the
+# prebuilt module loads but never initialises its hooks (verified with both KernelSU Next
+# v3.4.0 and upstream KernelSU v3.3.0):
+#   * module resident in /sys/module/kernelsu
+#   * no "welcome to KernelSU" printk, no hook_manager init
+#   * /data/adb/ksud is never served, manager reports "Not installed"
 #
-# Nothing is compiled on the user's Mac; only the artifact (~0.5-40 MB) is downloaded.
+# FIX
+# Build KernelSU against a self-consistent AOSP kernel snapshot from the same era as the
+# image. `common-android14-6.1-2023-05-exp` pins common / virtual-device / build-kernel
+# together (May 2023), which is one month after the 6.1.23 image kernel.
+#
+# OUTPUTS
+#   builtin : Image + all *.ko  -> boot it with -kernel (GKI mode). KernelSU is compiled
+#                                 into the kernel, so its hooks match by construction.
+#   module  : kernelsu.ko       -> alternative LKM: keep the stock kernel and force-load
+#                                 this module from a patched ramdisk (/init = ksuinit).
+#
+# AVD kernels are built with the legacy Kleaf/Bazel flow, NOT build/build.sh (which no
+# longer exists on this branch). Config is gki_defconfig merged with the virtual-device
+# fragments, so CONFIG_KSU is appended to common/arch/arm64/configs/gki_defconfig.
 
 on:
   workflow_dispatch:
@@ -27,18 +37,14 @@ on:
         description: 'KernelSU Next setup.sh ref: tag (recommended) or stable/legacy/dev'
         required: true
         default: 'v3.4.0'
-      kernel_commit:
-        description: 'Exact kernel commit from `uname -r` (the g<sha> part); empty = branch HEAD'
-        required: false
-        default: '7e35917775b8'
       kernel_branch:
-        description: 'kernel/manifest branch'
+        description: 'kernel/manifest branch (keep the dated snapshot for a consistent tree)'
         required: true
-        default: 'common-android14-6.1'
+        default: 'common-android14-6.1-2023-05-exp'
       ksu_mode:
-        description: 'module (=LKM, recommended) or builtin'
+        description: 'builtin (recommended) or module'
         required: true
-        default: 'module'
+        default: 'builtin'
 
 jobs:
   build:
@@ -85,19 +91,19 @@ jobs:
           repo sync -c -j"$(nproc)" --no-tags --no-clone-bundle
           echo "KERNEL_DIR=$RUNNER_TEMP/kernel" >> "$GITHUB_ENV"
 
-      - name: Pin the exact emulator kernel commit
+      - name: Inspect tree layout
         run: |
-          cd "$KERNEL_DIR/common"
-          git log -1 --oneline
-          if [ -n "${{ inputs.kernel_commit }}" ]; then
-            if git fetch --depth=1 origin "${{ inputs.kernel_commit }}" 2>/dev/null; then
-              git checkout "${{ inputs.kernel_commit }}"
-              echo "pinned to ${{ inputs.kernel_commit }}"
-            else
-              echo "::warning::commit ${{ inputs.kernel_commit }} not fetchable; building branch HEAD"
-            fi
-          fi
-          git log -1 --oneline
+          cd "$KERNEL_DIR"
+          echo "--- workspace root ---"; ls -la | head -25
+          echo "--- build entry points ---"
+          ls -la tools/bazel 2>/dev/null || echo "no tools/bazel"
+          ls -la build/build.sh 2>/dev/null || echo "no build/build.sh (Kleaf only, as expected)"
+          echo "--- base defconfig ---"
+          ls -la common/arch/arm64/configs/gki_defconfig
+          echo "--- bazel configs available ---"
+          grep -rn "config:local\|config:remote\|config:rbe" .bazelrc common/.bazelrc build/kernel/.bazelrc 2>/dev/null | head -5 || true
+          echo "--- prebuilt bazel ---"
+          ls prebuilts/bazel/linux-x86_64/ 2>/dev/null | head -3
 
       - name: Integrate KernelSU Next (${{ inputs.ksu_ref }})
         run: |
@@ -105,53 +111,62 @@ jobs:
           curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/next/kernel/setup.sh" | bash -s "${{ inputs.ksu_ref }}"
           echo "--- integration markers ---"
           ls -d drivers/kernelsu 2>/dev/null || true
-          grep -rn "CONFIG_KSU" arch/arm64/configs/gki_defconfig 2>/dev/null || true
-          grep -rn "KernelSU" Kconfig 2>/dev/null | head -3 || true
+          grep -n "kernelsu" drivers/Kconfig drivers/Makefile 2>/dev/null | head -4
+          grep -n "config KSU" -A4 drivers/kernelsu/Kconfig 2>/dev/null | head -8
 
-      - name: Build (KernelSU as loadable module)
-        if: inputs.ksu_mode == 'module'
+      - name: Enable CONFIG_KSU in the base defconfig
         env:
-          POST_DEFCONFIG_CMDS: "scripts/config --file .config --module KSU"
+          KSU_MODE: ${{ inputs.ksu_mode }}
         run: |
-          cd "$KERNEL_DIR"
-          LTO=thin BUILD_CONFIG=common-modules/virtual-device/build.config.virtual_device.aarch64 \
-            build/build.sh -j"$(nproc)"
+          cd "$KERNEL_DIR/common"
+          DEFCONFIG=arch/arm64/configs/gki_defconfig
+          if [ "$KSU_MODE" = "module" ]; then VALUE=m; else VALUE=y; fi
+          # drop any existing KSU lines, then append ours
+          sed -i '/^CONFIG_KSU\b/d' "$DEFCONFIG"
+          echo "CONFIG_KSU=$VALUE" >> "$DEFCONFIG"
+          echo "--- tail of $DEFCONFIG ---"; tail -3 "$DEFCONFIG"
+          grep -n "^CONFIG_KSU" "$DEFCONFIG"
 
-      - name: Build (KernelSU built in, exact stock version string)
-        if: inputs.ksu_mode == 'builtin'
-        env:
-          POST_DEFCONFIG_CMDS: >-
-            scripts/config --file .config
-            --set-str LOCALVERSION "-android14-4-00257-g7e35917775b8-ab9964412"
-            --disable LOCALVERSION_AUTO
+      - name: Build with Kleaf (virtual_device_aarch64_dist)
         run: |
           cd "$KERNEL_DIR"
-          LTO=thin BUILD_CONFIG=common-modules/virtual-device/build.config.virtual_device.aarch64 \
-            build/build.sh -j"$(nproc)"
+          DIST="$KERNEL_DIR/out/dist"
+          set -o pipefail
+          # --config=local disables RBE; if it is not defined in this tree, retry without.
+          if ! tools/bazel run --config=local //common-modules/virtual-device:virtual_device_aarch64_dist \
+                 -- --dist_dir="$DIST" 2>&1 | tail -80; then
+            echo "::warning::build with --config=local failed; retrying without it"
+            tools/bazel run //common-modules/virtual-device:virtual_device_aarch64_dist \
+              -- --dist_dir="$DIST" 2>&1 | tail -80
+          fi
+          echo "--- dist ---"; ls -la "$DIST" | head -30
 
-      - name: Verify KernelSU is really in the build
+      - name: Verify KernelSU made it into the build
         run: |
           cd "$KERNEL_DIR"
-          echo "--- CONFIG_KSU in built config ---"
-          grep -E "^CONFIG_KSU" out/*/.config 2>/dev/null || grep -E "^CONFIG_KSU" out/**/.config 2>/dev/null || true
-          echo "--- version string compiled in ---"
-          grep -m1 "UTS_RELEASE" out/*/include/generated/utsrelease.h 2>/dev/null || true
+          echo "--- CONFIG_KSU in generated configs ---"
+          find . -maxdepth 5 -name ".config" -path "*out*" -exec sh -c 'echo "== $1"; grep -E "^CONFIG_KSU" "$1" || echo "(absent)"' _ {} \; 2>/dev/null | head -20
+          echo "--- utsrelease ---"
+          find . -maxdepth 6 -name utsrelease.h -path "*out*" -exec sh -c 'echo "== $1"; cat "$1"' _ {} \; 2>/dev/null | head -10
+          echo "--- kernelsu objects ---"
+          find out -name "kernelsu*.ko" -o -name "kernelsu.o" 2>/dev/null | head -10
 
       - name: Collect artifacts
         run: |
           mkdir -p "$RUNNER_TEMP/artifacts"
-          DIST="$(find "$KERNEL_DIR/out" -maxdepth 4 -type d -name dist | head -1)"
-          echo "DIST=$DIST"; ls -la "$DIST" || true
+          DIST="$KERNEL_DIR/out/dist"
           cp "$DIST/Image" "$RUNNER_TEMP/artifacts/" 2>/dev/null || echo "no Image in dist"
           cp "$DIST/System.map" "$RUNNER_TEMP/artifacts/" 2>/dev/null || true
           cp "$DIST/vmlinux" "$RUNNER_TEMP/artifacts/" 2>/dev/null || true
-          # every module (kernelsu.ko in module mode, virtio etc. for the fallback boot)
+          # all modules (virtio_* etc. for the GKI boot, kernelsu.ko for module mode)
           find "$KERNEL_DIR/out" -name '*.ko' -exec cp -n {} "$RUNNER_TEMP/artifacts/" \; 2>/dev/null || true
+          gzip -kf "$RUNNER_TEMP/artifacts/Image" 2>/dev/null || true
           ls -la "$RUNNER_TEMP/artifacts"
-          if [ ! -f "$RUNNER_TEMP/artifacts/kernelsu.ko" ]; then
-            echo "::warning::no kernelsu.ko (expected for ksu_mode=builtin)"
-          fi
           test -f "$RUNNER_TEMP/artifacts/Image" || { echo "::error::no Image produced"; exit 1; }
+          if [ "${{ inputs.ksu_mode }}" = "module" ] && [ ! -f "$RUNNER_TEMP/artifacts/kernelsu.ko" ]; then
+            echo "::error::module mode but no kernelsu.ko"
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
